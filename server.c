@@ -8,6 +8,7 @@
 #include <regex.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -15,12 +16,49 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define PORT 8080
+#define DEFAULT_PORT 8080
 #define BUFFER_SIZE 104857600
+
+const char DEFAULT_WEB_ROOT[] = "./web_root";
+
+typedef struct  {
+    int port;
+    char root_dir[1024];
+} ServerOptions;
+
+char *concat_string(const char* str1, const char* str2) {
+    size_t length = strlen(str1) + strlen(str2) + 1; // +1 for the null terminator
+    char *buffer = (char *)malloc(length);
+    strcpy(buffer, str1);
+    strcat(buffer, str2);
+    return buffer;
+}
+
+bool file_exists(const char *filename) {
+    FILE *file = fopen(filename, "r");
+    if (file != NULL) {
+        fclose(file);
+        return true;
+    }
+    return false;
+}
+
+int is_directory(const char *path) {
+    struct stat statbuf;
+    if (stat(path, &statbuf) != 0)
+        return 0;
+    return S_ISDIR(statbuf.st_mode);
+}
 
 const char *get_file_extension(const char *file_name) {
     const char *dot = strrchr(file_name, '.');
     if (!dot || dot == file_name) {
+        char *suffixed_file_name = concat_string(file_name, ".json");
+        if (file_exists(suffixed_file_name)) {
+            free(suffixed_file_name);
+            return "json";
+        }
+        free(suffixed_file_name);
         return "";
     }
     return dot + 1;
@@ -35,6 +73,8 @@ const char *get_mime_type(const char *file_ext) {
         return "image/jpeg";
     } else if (strcasecmp(file_ext, "png") == 0) {
         return "image/png";
+    } else if (strcasecmp(file_ext, "json") == 0) {
+        return "application/json";
     } else {
         return "application/octet-stream";
     }
@@ -93,28 +133,83 @@ char *url_decode(const char *src) {
     return decoded;
 }
 
+char *read_file(const char *filename, size_t *fileSize) {
+    FILE *file = fopen(filename, "rb"); // Open in binary mode to handle all file types correctly
+
+    if (file == NULL) {
+        perror("Error opening file"); // Print an error message to the console
+        return NULL; // Indicate an error
+    }
+
+    // Determine the file size
+    fseek(file, 0, SEEK_END); // Move the file pointer to the end of the file
+    long file_size_long = ftell(file); // Get the current position (which is the file size)
+    rewind(file); // Reset the file pointer to the beginning of the file
+
+    // Check for potential errors with file size (e.g., if it's too large)
+    if (file_size_long < 0) {
+        perror("Error getting file size");
+        fclose(file);
+        return NULL;
+    }
+
+    // Ensure file size doesn't exceed the maximum size of size_t
+    if (file_size_long > SIZE_MAX) {
+        fprintf(stderr, "File size is too large to handle.\n");
+        fclose(file);
+        return NULL;
+    }
+    *fileSize = (size_t)file_size_long; // Cast to size_t (safer)
+
+    // Allocate memory for the character array
+    char *buffer = (char *)malloc(*fileSize + 1); // +1 for the null terminator
+    if (buffer == NULL) {
+        perror("Error allocating memory");
+        fclose(file);
+        return NULL;
+    }
+
+    // Read the file into the buffer
+    size_t bytesRead = fread(buffer, 1, *fileSize, file);
+    if (bytesRead != *fileSize) {
+        if (ferror(file)) {
+            perror("Error reading file");
+            free(buffer);
+            fclose(file);
+            return NULL;
+        }
+    }
+
+    // 4. Null-terminate the buffer (important for strings!)
+    buffer[*fileSize] = '\0';
+
+    // 5. Close the file
+    fclose(file);
+
+    return buffer; // Return the pointer to the character array
+}
+
 void build_http_response(const char *file_name, 
-                        const char *file_ext, 
+                        const char *file_ext,
                         char *response, 
                         size_t *response_len) {
     // build HTTP header
     const char *mime_type = get_mime_type(file_ext);
-    char *header = (char *)malloc(BUFFER_SIZE * sizeof(char));
-    snprintf(header, BUFFER_SIZE,
-             "HTTP/1.1 200 OK\r\n"
-             "Content-Type: %s\r\n"
-             "\r\n",
-             mime_type);
 
-    // if file not exist, response is 404 Not Found
     int file_fd = open(file_name, O_RDONLY);
     if (file_fd == -1) {
-        snprintf(response, BUFFER_SIZE,
-                 "HTTP/1.1 404 Not Found\r\n"
-                 "Content-Type: text/plain\r\n"
-                 "\r\n"
-                 "404 Not Found");
-        *response_len = strlen(response);
+        // If file doesn't exist, check if file with ".json" suffix exists
+        char *suffixed_file_name = concat_string(file_name, ".json");
+        file_fd = open(suffixed_file_name, O_RDONLY);
+        free(suffixed_file_name);
+    }
+    if (file_fd == -1) {
+        // If file still doesn't exist, return default_response
+        size_t default_response_file_size;
+        char *default_response = read_file("default_response", &default_response_file_size);
+        memcpy(response, default_response, default_response_file_size);
+        *response_len = default_response_file_size;
+        free(default_response);
         return;
     }
 
@@ -123,10 +218,18 @@ void build_http_response(const char *file_name,
     fstat(file_fd, &file_stat);
     off_t file_size = file_stat.st_size;
 
+    char *header = (char *)malloc(BUFFER_SIZE * sizeof(char));
+    snprintf(header, BUFFER_SIZE,
+             "HTTP/1.1 200 OK\r\n"
+             "Content-Type: %s\r\n"
+             "\r\n",
+             mime_type);
+
     // copy header to response buffer
     *response_len = 0;
     memcpy(response, header, strlen(header));
     *response_len += strlen(header);
+    free(header);
 
     // copy file to response buffer
     ssize_t bytes_read;
@@ -135,7 +238,7 @@ void build_http_response(const char *file_name,
                             BUFFER_SIZE - *response_len)) > 0) {
         *response_len += bytes_read;
     }
-    free(header);
+
     close(file_fd);
 }
 
@@ -146,15 +249,15 @@ void *handle_client(void *arg) {
     // receive request data from client and store into buffer
     ssize_t bytes_received = recv(client_fd, buffer, BUFFER_SIZE, 0);
     if (bytes_received > 0) {
-        // check if request is GET
+        // parse the request
         regex_t regex;
-        regcomp(&regex, "^GET /([^ ]*) HTTP/1", REG_EXTENDED);
-        regmatch_t matches[2];
+        regcomp(&regex, "^([A-Z]+) /([^ ?]*)\\?{0,1}(.*) HTTP/1", REG_EXTENDED);
+        regmatch_t matches[3];
 
-        if (regexec(&regex, buffer, 2, matches, 0) == 0) {
+        if (regexec(&regex, buffer, 3, matches, 0) == 0) {
             // extract filename from request and decode URL
-            buffer[matches[1].rm_eo] = '\0';
-            const char *url_encoded_file_name = buffer + matches[1].rm_so;
+            buffer[matches[2].rm_eo] = '\0';
+            const char *url_encoded_file_name = buffer + matches[2].rm_so;
             char *file_name = url_decode(url_encoded_file_name);
 
             // get file extension
@@ -180,10 +283,11 @@ void *handle_client(void *arg) {
     return NULL;
 }
 
-int main(int argc, char *argv[]) {
+int create_server(int port) {
     int server_fd;
     struct sockaddr_in server_addr;
 
+    printf("Starting server at port %i\n", port);
     // create server socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("socket failed");
@@ -193,11 +297,11 @@ int main(int argc, char *argv[]) {
     // config socket
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    server_addr.sin_port = htons(port);
 
     // bind socket to port
-    if (bind(server_fd, 
-            (struct sockaddr *)&server_addr, 
+    if (bind(server_fd,
+            (struct sockaddr *)&server_addr,
             sizeof(server_addr)) < 0) {
         perror("bind failed");
         exit(EXIT_FAILURE);
@@ -209,7 +313,10 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    printf("Server listening on port %d\n", PORT);
+    return server_fd;
+}
+
+void server_listen(int server_fd) {
     while (1) {
         // client info
         struct sockaddr_in client_addr;
@@ -217,8 +324,8 @@ int main(int argc, char *argv[]) {
         int *client_fd = malloc(sizeof(int));
 
         // accept client connection
-        if ((*client_fd = accept(server_fd, 
-                                (struct sockaddr *)&client_addr, 
+        if ((*client_fd = accept(server_fd,
+                                (struct sockaddr *)&client_addr,
                                 &client_addr_len)) < 0) {
             perror("accept failed");
             continue;
@@ -229,7 +336,74 @@ int main(int argc, char *argv[]) {
         pthread_create(&thread_id, NULL, handle_client, (void *)client_fd);
         pthread_detach(thread_id);
     }
+}
 
+int parse_arguments(int argc, char*argv[], ServerOptions *options) {
+    int opt;
+    while((opt = getopt(argc, argv, ":p:d:h")) != -1)
+    {
+        switch(opt)
+        {
+            case 'p':
+                int port_int = atoi(optarg);
+                if (port_int > 0) {
+                    printf("Using port: %s\n", optarg);
+                    options->port = atoi(optarg);
+                } else {
+                    printf("Invalid port: %s\n", optarg);
+                    return 1;
+                }
+                break;
+            case 'd':
+                if (is_directory(optarg)) {
+                    printf("Using web root directory: %s\n", optarg);
+                    strcpy(options->root_dir, optarg);
+                } else {
+                    printf("Invalid directory: %s\n", optarg);
+                    return 1;
+                }
+                break;
+            case 'h':
+                printf("Usage:\n");
+                printf("-p <PORT>         Web server's port number\n");
+                printf("-d <DIRECTORY>    Root directory of web content\n");
+                return 1;
+            case ':':
+                printf("option needs a value\n");
+                break;
+            case '?':
+                printf("unknown option: %c\n", optopt);
+                break;
+        }
+    }
+
+    // optind is for the extra arguments
+    // which are not parsed
+    for(; optind < argc; optind++){
+        printf("extra arguments: %s\n", argv[optind]);
+    }
+
+    if (options->port == 0) {
+        options->port = DEFAULT_PORT;
+        printf("Using default port: %d\n", DEFAULT_PORT);
+    }
+    if (strlen(options->root_dir) == 0) {
+        strcpy(options->root_dir, DEFAULT_WEB_ROOT);
+        printf("Using default web root directory: %s\n", DEFAULT_WEB_ROOT);
+    }
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    ServerOptions options = { 0, ""};
+    if(parse_arguments(argc, argv, &options) != 0 ) {
+        return EXIT_FAILURE;
+    }
+    if (strlen(options.root_dir) != 0) {
+        chdir(options.root_dir);
+    }
+    int server_fd = create_server(options.port);
+    server_listen(server_fd);
     close(server_fd);
     return 0;
 }
